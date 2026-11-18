@@ -34,7 +34,11 @@ import json
 import urllib.parse
 from src.utils.logger import setup_logger
 from src.utils.tool_naming import sanitize_tool_name, unique_tool_name
-from src.services.adk.custom_tools import CustomToolBuilder, strip_modes_meta
+from src.services.adk.custom_tools import (
+    CustomToolBuilder,
+    llm_signature,
+    strip_modes_meta,
+)
 from src.services.adk.tools import exit_loop
 from src.services.adk.tools import create_text_to_speech_tool
 
@@ -109,7 +113,10 @@ class ToolBuilder:
         def http_tool(**kwargs):
             try:
                 # Combines default values with provided values
-                all_values = {**values, **kwargs}
+                all_values = {
+                    **values,
+                    **{k: v for k, v in kwargs.items() if v is not None},
+                }
 
                 # Substitutes placeholders in headers
                 processed_headers = {
@@ -273,6 +280,11 @@ class ToolBuilder:
             logger.info(
                 f"Custom tool '{name}' is exposed to the LLM as '{http_tool.__name__}'"
             )
+
+        # Lets google-adk hand the model's arguments to the function.
+        signature = llm_signature(parameters)
+        if signature is not None:
+            http_tool.__signature__ = signature
 
         return FunctionTool(func=http_tool)
 
