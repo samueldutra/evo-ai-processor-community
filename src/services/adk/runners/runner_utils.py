@@ -39,6 +39,7 @@ from src.utils.logger import setup_logger
 from src.core.exceptions import AgentNotFoundError
 from src.services.agent_service import get_agent
 from src.services.adk.agent_builder import AgentBuilder
+from src.services.adk import audio_transcription
 from src.utils.adk_utils import extract_state_params
 from sqlalchemy.orm import Session
 from typing import Optional, List, Tuple, Dict, Any, Union
@@ -261,6 +262,30 @@ class RunnerUtils:
                 await session_service.append_event(session, new_metadata_event)
                 logger.info(f"[RunnerUtils] ✅ Stored metadata '{key}' in session state via ADK")
 
+    def _openai_key_for_agent(self, agent_id: str) -> Optional[str]:
+        """Decrypted OpenAI key of the agent's credential, or None.
+
+        None also when there is no db handle or the credential belongs to another
+        provider -- callers then keep the pre-existing inline-audio behavior.
+        """
+        db = getattr(self, "db", None)
+        if db is None or not agent_id:
+            return None
+        try:
+            from src.models.models import Agent, ApiKey
+            from src.services.apikey_service import get_decrypted_api_key
+
+            agent = db.query(Agent).filter(Agent.id == uuid.UUID(str(agent_id))).first()
+            if not agent or not agent.api_key_id:
+                return None
+            record = db.query(ApiKey).filter(ApiKey.id == agent.api_key_id).first()
+            if not record or (record.provider or "").lower() != "openai":
+                return None
+            return get_decrypted_api_key(db, agent.api_key_id, agent)
+        except Exception as e:
+            logger.error(f"Could not resolve OpenAI key for transcription: {e}")
+            return None
+
     async def process_files(
         self,
         files: Optional[List],
@@ -275,6 +300,8 @@ class RunnerUtils:
 
         if files and len(files) > 0:
             inlined_bytes = 0
+            transcription_key: Optional[str] = None
+            key_checked = False
             for file_data in files:
                 try:
                     # Check if file is audio
@@ -287,6 +314,40 @@ class RunnerUtils:
                     )
 
                     file_bytes = base64.b64decode(file_data.data)
+
+                    # Voice notes: transcribe and hand the model text. Raw opus
+                    # makes OpenAI chat models stall until the caller times out.
+                    if is_audio and transcription_key is None and not key_checked:
+                        key_checked = True
+                        if audio_transcription.is_enabled():
+                            transcription_key = self._openai_key_for_agent(agent_id)
+                    if is_audio and transcription_key:
+                        transcript = await audio_transcription.transcribe_audio(
+                            transcription_key,
+                            file_bytes,
+                            file_data.content_type,
+                            file_data.filename,
+                        )
+                        if transcript:
+                            transcribed_texts.append(f"[Áudio do cliente transcrito]: {transcript}")
+                        else:
+                            transcribed_texts.append(
+                                "[O cliente enviou um áudio que não foi possível transcrever]"
+                            )
+                        # Keep the original as an artifact, never send it to the model.
+                        await artifacts_service.save_artifact(
+                            app_name=agent_id,
+                            user_id=external_id,
+                            session_id=adk_session_id,
+                            filename=file_data.filename,
+                            artifact=Part(
+                                inline_data=Blob(
+                                    mime_type=file_data.content_type, data=file_bytes
+                                )
+                            ),
+                        )
+                        continue
+
                     file_part = Part(
                         inline_data=Blob(
                             mime_type=file_data.content_type,
