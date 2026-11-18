@@ -1,0 +1,73 @@
+name: Build & Publish (GHCR)
+
+# Publica a imagem deste fork em ghcr.io/samueldutra/evo-ai-processor-community.
+# Disparo manual: Actions > "Build & Publish (GHCR)" > Run workflow
+#   ref: tag/branch/sha a buildar (ex.: v1.1.0 ou feat/minha-mudanca)
+#   tag: tag da imagem (ex.: 1.1.0-inv.1). Nunca usamos :latest.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref a buildar (tag, branch ou sha)"
+        required: true
+        default: "main"
+      tag:
+        description: "Tag da imagem (ex.: 1.1.0-inv.1)"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/samueldutra/evo-ai-processor-community
+
+jobs:
+  build:
+    name: Build amd64 e push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tags
+        id: tags
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          SHA_SHORT="$(git rev-parse --short=7 HEAD)"
+          echo "sha=${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "tags=${IMAGE_NAME}:${INPUT_TAG},${IMAGE_NAME}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push (amd64)
+        id: build
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            APP_VERSION=${{ inputs.ref }}
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha,scope=ghcr-amd64
+          cache-to: type=gha,scope=ghcr-amd64,mode=max
+
+      - name: Resumo
+        run: |
+          {
+            echo "### Imagem publicada"
+            echo "${IMAGE_NAME}:${{ inputs.tag }}"
+            echo "digest: ${{ steps.build.outputs.digest }}"
+            echo "commit: ${{ steps.tags.outputs.sha }} (ref ${{ inputs.ref }})"
+          } >> "$GITHUB_STEP_SUMMARY"

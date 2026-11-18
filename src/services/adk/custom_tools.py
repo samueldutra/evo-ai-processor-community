@@ -31,7 +31,10 @@ from typing import Any, Container, Dict, List, Optional
 from google.adk.tools import FunctionTool
 from google.adk.tools.tool_context import ToolContext
 import requests
+import inspect
 import json
+import keyword
+import re
 import urllib.parse
 from src.utils.logger import setup_logger
 from src.utils.tool_naming import sanitize_tool_name, unique_tool_name
@@ -92,6 +95,67 @@ def _apply_vault_refs(tool_config, headers, _db=None):
     finally:
         session.close()
 
+
+_PLACEHOLDER_RE = re.compile(r"^\{\s*(\w+)\s*\}$")
+
+
+def llm_signature(parameters):
+    """Builds the explicit signature the LLM-facing function must expose.
+
+    google-adk keeps only the arguments whose names appear in the function
+    signature (FunctionTool.run_async). The HTTP tools are defined as
+    ``def http_tool(**kwargs)``, whose signature only names ``kwargs``, so every
+    argument the model sent was silently dropped and the configured defaults
+    (for instance the literal ``{q}``) went out on the wire.
+
+    Only the parameters meant to be filled by the model are exposed, so a
+    static value (``per_page=3``, ``fields=...``) cannot be overridden by it:
+      * query params whose configured value is a placeholder, ``{name}``;
+      * path params;
+      * body params.
+    Returns None when there is nothing to expose or no name is a valid
+    identifier, which leaves the previous behaviour untouched.
+    """
+    parameters = parameters or {}
+    names = []
+
+    for name, value in (parameters.get("query_params") or {}).items():
+        if isinstance(value, str) and _PLACEHOLDER_RE.match(value.strip()):
+            names.append((name, True))
+    for name in (parameters.get("path_params") or {}):
+        names.append((name, True))
+    for name, cfg in (parameters.get("body_params") or {}).items():
+        required = bool(cfg.get("required", False)) if isinstance(cfg, dict) else False
+        names.append((name, required))
+
+    params = []
+    seen = set()
+    for name, required in names:
+        if name in seen or not name.isidentifier() or keyword.iskeyword(name):
+            continue
+        seen.add(name)
+        if required:
+            params.append(
+                inspect.Parameter(
+                    name, inspect.Parameter.KEYWORD_ONLY, annotation=str
+                )
+            )
+        else:
+            params.append(
+                inspect.Parameter(
+                    name,
+                    inspect.Parameter.KEYWORD_ONLY,
+                    default=None,
+                    annotation=Optional[str],
+                )
+            )
+
+    if not params:
+        return None
+    # Required (no default) parameters first is not mandatory for keyword-only.
+    return inspect.Signature(params)
+
+
 class CustomToolBuilder:
     def __init__(self):
         self.tools = []
@@ -123,7 +187,10 @@ class CustomToolBuilder:
         def http_tool(**kwargs):
             try:
                 # Combines default values with provided values
-                all_values = {**values, **kwargs}
+                all_values = {
+                    **values,
+                    **{k: v for k, v in kwargs.items() if v is not None},
+                }
 
                 # Substitutes placeholders in headers
                 processed_headers = {
@@ -249,6 +316,11 @@ class CustomToolBuilder:
             logger.info(
                 f"Custom tool '{name}' is exposed to the LLM as '{http_tool.__name__}'"
             )
+
+        # Lets google-adk hand the model's arguments to the function (see llm_signature).
+        signature = llm_signature(parameters)
+        if signature is not None:
+            http_tool.__signature__ = signature
 
         return FunctionTool(func=http_tool)
 
